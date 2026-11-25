@@ -1,0 +1,287 @@
+﻿// ---------------- CHÂN (THEO SƠ ĐỒ ĐANG CHẠY ĐÚNG) ----------------
+const int STBY_PIN = PB10;
+
+const int PWMA_PIN = PA8;
+const int AIN1_PIN = PB12;
+const int AIN2_PIN = PB15;
+
+const int PWMB_PIN = PA9;
+const int BIN1_PIN = PB14;
+const int BIN2_PIN = PB13;
+
+const int sensorPins[8] = {PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0};
+
+// DIP nối xuống GND khi ON. Đọc một lần lúc bật nguồn/reset.
+const int dipPins[4] = {PA11, PA12, PB8, PB9};
+int baseSpeed = 70;
+bool blackReadsLow = false;
+bool invertSteering = false;
+
+void readSwitches() {
+  for (int pin : dipPins) pinMode(pin, INPUT_PULLUP);
+  delay(10);
+  // SW1 ON: chạy chậm. SW2 ON: tăng tốc. Bật cả hai: tốc độ trung gian.
+  const int speeds[4] = {70, 50, 80, 60};
+  int mode = (digitalRead(dipPins[0]) == LOW ? 1 : 0)
+           + (digitalRead(dipPins[1]) == LOW ? 2 : 0);
+  baseSpeed = speeds[mode];
+  blackReadsLow = digitalRead(dipPins[2]) == LOW;
+  invertSteering = digitalRead(dipPins[3]) == LOW;
+}
+
+const int MAX_SAFE_PWM = 110;
+const unsigned long SAMPLE_US = 4000;
+const unsigned long LOST_LINE_TIMEOUT_MS = 700;
+int sensorMin[8], sensorMax[8];
+enum DriveState { WAIT_LINE, FOLLOW, CHECK_BRANCH, SEARCH };
+void enterState(DriveState next, unsigned long now);
+DriveState state = WAIT_LINE;
+unsigned long lastSampleUs, stateStartMs;
+int stableSamples = 0, widthSum = 0, normalWidth = 2;
+int branchSides = 0, previousSides = 0, direction = 0;
+bool pdReady = false;
+float lastError = 0, filteredRate = 0;
+const int PROBE_PWM = 45, TURN_PWM = 65;
+const unsigned long PROBE_LIMIT_MS = 200, GAP_MS = 20;
+// ---------------- MOTOR ----------------
+void setLeftMotor(int speed) {
+  speed = constrain(speed, -MAX_SAFE_PWM, MAX_SAFE_PWM);
+  if (speed > 0) {
+    digitalWrite(AIN1_PIN, HIGH);
+    digitalWrite(AIN2_PIN, LOW);
+    analogWrite(PWMA_PIN, speed);
+  } else if (speed < 0) {
+    digitalWrite(AIN1_PIN, LOW);
+    digitalWrite(AIN2_PIN, HIGH);
+    analogWrite(PWMA_PIN, -speed);
+  } else {
+    digitalWrite(AIN1_PIN, LOW);
+    digitalWrite(AIN2_PIN, LOW);
+    analogWrite(PWMA_PIN, 0);
+  }
+}
+
+void setRightMotor(int speed) {
+  speed = constrain(speed, -MAX_SAFE_PWM, MAX_SAFE_PWM);
+  if (speed > 0) {
+    digitalWrite(BIN1_PIN, HIGH);
+    digitalWrite(BIN2_PIN, LOW);
+    analogWrite(PWMB_PIN, speed);
+  } else if (speed < 0) {
+    digitalWrite(BIN1_PIN, LOW);
+    digitalWrite(BIN2_PIN, HIGH);
+    analogWrite(PWMB_PIN, -speed);
+  } else {
+    digitalWrite(BIN1_PIN, LOW);
+    digitalWrite(BIN2_PIN, LOW);
+    analogWrite(PWMB_PIN, 0);
+  }
+}
+
+void stopMotors() {
+  setLeftMotor(0);
+  setRightMotor(0);
+}
+
+// ---------------- CẢM BIẾN ----------------
+void calibrateSensors() {
+  for (int i = 0; i < 8; i++) {
+    sensorMin[i] = 4095;
+    sensorMax[i] = 0;
+  }
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    for (int i = 0; i < 8; i++) {
+      int raw = analogRead(sensorPins[i]);
+      if (raw < sensorMin[i]) sensorMin[i] = raw;
+      if (raw > sensorMax[i]) sensorMax[i] = raw;
+    }
+  }
+}
+
+long getLinePosition(unsigned int &darkMask) {
+  darkMask = 0;
+  long weighted = 0, total = 0;
+  int peak = 0;
+  for (int i = 0; i < 8; i++) {
+    int range = sensorMax[i] - sensorMin[i];
+    if (range <= 50) continue;
+    int raw = analogRead(sensorPins[i]);
+    int value = constrain(raw, sensorMin[i], sensorMax[i]);
+    value = (long)(value - sensorMin[i]) * 1000 / range;
+    if (blackReadsLow) value = 1000 - value;
+    if (value >= 550) darkMask |= 1u << i;
+    peak = max(peak, value);
+    int weight = max(0, value - 150);
+    weighted += (long)weight * i * 1000;
+    total += weight;
+  }
+  if (peak < (state == FOLLOW ? 350 : 450) || total == 0) return -1;
+  return weighted / total;
+}
+
+void enterState(DriveState next, unsigned long now) {
+  state = next;
+  stateStartMs = now;
+  stableSamples = 0;
+  pdReady = false;
+  if (next == WAIT_LINE) {
+    direction = 0;
+    widthSum = 0;
+    stopMotors();
+  }
+}
+
+void drive(int forward, int steer) {
+  if (invertSteering) steer = -steer;
+  setLeftMotor(forward + steer);
+  setRightMotor(forward - steer);
+}
+
+void trackPosition(long position, unsigned long elapsed) {
+  float error = position - 3500.0f;
+  if (pdReady && elapsed < 50000) {
+    float dt = elapsed * 0.000001f;
+    float rate = (error - lastError) / dt;
+    filteredRate += dt / (0.018f + dt) * (rate - filteredRate);
+  } else {
+    filteredRate = 0;
+  }
+  pdReady = true;
+  lastError = error;
+  int base = baseSpeed - (int)((baseSpeed - 30) * fabs(error) / 3500.0f);
+  float correction = 0.032f * error + 0.00025f * filteredRate;
+  drive(base, (int)constrain(correction, -90.0f, 90.0f));
+}
+
+// mask: bit 0..7 theo thứ tự sensorPins. direction dùng cùng hệ trục với position.
+void updateDrive(unsigned int mask, long position, unsigned long now, unsigned long elapsed) {
+  int count = 0, groups = 0;
+  for (int i = 0; i < 8; ++i) {
+    if (mask & (1u << i)) {
+      ++count;
+      if (i == 0 || !(mask & (1u << (i - 1)))) ++groups;
+    }
+  }
+  bool center = (mask & 0x18) != 0;
+  bool centered = groups == 1 && center && (mask & 0x81) == 0
+                  && abs(position - 3500L) <= 900;
+  int sides = ((mask & 0x03) ? 1 : 0) | ((mask & 0xC0) ? 2 : 0);
+  bool wide = count > normalWidth + 1 || groups > 1 || mask == 0xFF;
+  bool normalCenter = centered && !wide;
+
+  if (state == WAIT_LINE) {
+    if (!centered) {
+      stableSamples = widthSum = 0;
+      return;
+    }
+    widthSum += count;
+    if (++stableSamples < 6) return;
+    normalWidth = (widthSum + 3) / 6;
+    enterState(FOLLOW, now);
+  }
+
+  if (state == FOLLOW) {
+    if (position < 0) {
+      enterState(SEARCH, now);
+    } else if (wide && sides) {
+      branchSides = 0;
+      previousSides = 0;
+      enterState(CHECK_BRANCH, now);
+    } else {
+      // Xóa hướng cũ khi xe đã đi giữa vạch trở lại.
+      if (centered) direction = 0;
+      else if (abs(position - 3500L) > 900) direction = position < 3500 ? -1 : 1;
+      trackPosition(position, elapsed);
+      return;
+    }
+  }
+
+  if (state == CHECK_BRANCH) {
+    // Chỉ ghi nhớ phía xuất hiện liên tiếp trong vùng vạch mở rộng.
+    if (wide) branchSides |= previousSides & sides;
+    previousSides = wide ? sides : 0;
+    if (now - stateStartMs >= PROBE_LIMIT_MS) {
+      enterState(WAIT_LINE, now);
+      return;
+    }
+    if (normalCenter) {
+      if (++stableSamples >= 3) {
+        direction = 0;
+        enterState(FOLLOW, now);
+        trackPosition(position, elapsed);
+        return;
+      }
+    } else {
+      stableSamples = 0;
+    }
+    if (!center && !wide) {
+      // Vạch hẹp còn nhìn thấy ở mép cho biết hướng ngay cả khi tín hiệu nhánh ngắn.
+      if (position >= 0 && groups == 1 && abs(position - 3500L) > 900)
+        direction = position < 3500 ? -1 : 1;
+      else
+        direction = branchSides == 1 ? -1 : (branchSides == 2 ? 1 : 0);
+      enterState(SEARCH, now);
+    } else {
+      drive(PROBE_PWM, 0);
+      return;
+    }
+  }
+
+  // SEARCH: vượt khe ngắn, xoay theo phía có bằng chứng, xác nhận lại tâm.
+  if (now - stateStartMs >= LOST_LINE_TIMEOUT_MS) {
+    enterState(WAIT_LINE, now);
+    return;
+  }
+  if (normalCenter) {
+    drive(PROBE_PWM, 0);
+    if (++stableSamples >= 3) {
+      direction = 0;
+      enterState(FOLLOW, now);
+      trackPosition(position, elapsed);
+    }
+    return;
+  }
+  stableSamples = 0;
+  if (position >= 0 && groups == 1 && !wide && abs(position - 3500L) > 900)
+    direction = position < 3500 ? -1 : 1;
+  if (now - stateStartMs < GAP_MS) drive(PROBE_PWM, 0);
+  else if (direction) drive(0, direction * TURN_PWM);
+  else stopMotors();
+}
+
+void followLine() {
+  unsigned long nowUs = micros();
+  unsigned long elapsed = nowUs - lastSampleUs;
+  if (elapsed < SAMPLE_US) return;
+  lastSampleUs = nowUs;
+  unsigned int mask;
+  long position = getLinePosition(mask);
+  updateDrive(mask, position, millis(), elapsed);
+}
+// ---------------- SETUP / LOOP ----------------
+void setup() {
+  analogReadResolution(12);
+  readSwitches();
+
+  pinMode(STBY_PIN, OUTPUT);
+  pinMode(PWMA_PIN, OUTPUT);
+  pinMode(AIN1_PIN, OUTPUT);
+  pinMode(AIN2_PIN, OUTPUT);
+  pinMode(PWMB_PIN, OUTPUT);
+  pinMode(BIN1_PIN, OUTPUT);
+  pinMode(BIN2_PIN, OUTPUT);
+
+  stopMotors();
+  digitalWrite(STBY_PIN, HIGH);
+
+  delay(1000);
+  calibrateSensors();
+  delay(2000);
+  lastSampleUs = micros();
+}
+
+void loop() {
+  followLine();
+}
+
