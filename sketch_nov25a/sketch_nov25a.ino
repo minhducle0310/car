@@ -27,7 +27,7 @@ const long MOTOR_RATED_MV = 6000;
 const long BATTERY_FULL_MV = 8400;
 const int MAX_DRIVE_PWM = PWM_FULL_SCALE * MOTOR_RATED_MV / BATTERY_FULL_MV; // 182
 const int BASE_SPEED = 150;
-const int SEARCH_OUTER_PWM = 150;
+const int SEARCH_OUTER_PWM = 100;
 const int RUN_BASE_PWM = 60; // Mức nền đã thử trên xe
 static_assert(BASE_SPEED <= MAX_DRIVE_PWM, "BASE_SPEED vuot gioi han PWM");
 
@@ -46,8 +46,8 @@ const float SEARCH_DIRECTION_MIN_ERROR = 0.30f;
 const float CENTER_ERROR_LIMIT = 0.24f;
 const int CENTER_CONFIRM_SAMPLES = 3;
 const unsigned long TURN_MEMORY_MS = 320;
-const unsigned long FIRST_SWEEP_MS = 240;
-const unsigned long SEARCH_TIMEOUT_MS = 800;
+const unsigned long FIRST_SWEEP_MS = 1000;     // Quay theo hướng vừa thấy vạch
+const unsigned long SEARCH_TIMEOUT_MS = 2400; // Tổng thời gian tìm, gồm cả lượt quét ngược
 const unsigned long LOOP_INTERVAL_US = 2000; // 500 Hz nếu đọc ADC và log kịp
 const unsigned long LOG_INTERVAL_MS = 50;
 
@@ -263,8 +263,8 @@ void stepLineFollowing(unsigned long elapsedUs) {
     // Quay quanh bánh trong để tìm lại vạch theo hướng đã thấy.
     int searchDirection = lastTurnDirection;
     if (nowMs - searchStartMs >= FIRST_SWEEP_MS) searchDirection = -searchDirection;
-    if (searchDirection > 0) leftCmd = min(SEARCH_OUTER_PWM, RUN_BASE_PWM);
-    else rightCmd = min(SEARCH_OUTER_PWM, RUN_BASE_PWM);
+    if (searchDirection > 0) leftCmd = SEARCH_OUTER_PWM;
+    else rightCmd = SEARCH_OUTER_PWM;
   }
 
   setSingleMotor(PWMA_PIN, AIN1_PIN, AIN2_PIN, INVERT_MOTOR_A, leftCmd);
