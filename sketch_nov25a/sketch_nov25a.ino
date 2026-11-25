@@ -63,7 +63,7 @@ int lineFirst = -1;
 int lineLast = -1;
 int wingDirection = 0;
 int wingSamples = 0;
-bool cornerArmed = false;
+bool hasStarted = false;
 float lastError = 0.0f;
 float integral = 0.0f;
 int lastTurnDirection = 0;
@@ -121,7 +121,7 @@ float readBlackStrength(int idx) {
 bool computeLineError(float &outError, float &outMaxStrength) {
   // Chọn một cụm mắt liên tiếp. Nếu thấy cụm ở tâm, ưu tiên cụm đó.
   // Một đốm đen rời ở mép không kéo trọng tâm của vạch giữa sang bên.
-  const float threshold = followState == FOLLOW_LINE ? LINE_HOLD_STRENGTH : LINE_ACQUIRE_STRENGTH;
+  const float threshold = hasStarted ? LINE_HOLD_STRENGTH : LINE_ACQUIRE_STRENGTH;
   float bestTotal = 0.0f;
   bool bestAtCenter = false;
   lineFirst = lineLast = -1;
@@ -153,6 +153,11 @@ bool computeLineError(float &outError, float &outMaxStrength) {
       lineFirst = first;
       lineLast = last;
       outError = moment / total;
+    } else if (atCenter == bestAtCenter && total == bestTotal &&
+               outError * moment < 0.0f) {
+      // Hai cụm đối diện mạnh bằng nhau: tránh tự chọn trái do thứ tự quét.
+      lineLast = last;
+      outError = 0.0f;
     }
   }
   return lineFirst >= 0;
@@ -178,7 +183,8 @@ void stepLineFollowing(unsigned long elapsedUs) {
   const float effectiveErr = fabsf(err) < DEADBAND_ERROR ? 0.0f : err;
   const float steeringError = INVERT_STEERING ? -effectiveErr : effectiveErr;
   const float absError = fabsf(steeringError);
-  const bool atCenter = hasLine && lineFirst <= 4 && lineLast >= 3;
+  const bool atCenter = hasLine && lineFirst <= 4 && lineLast >= 3 &&
+      max(lastStrength[3], lastStrength[4]) >= ACTIVE_STRENGTH_THRESHOLD;
   const bool centered = atCenter && absError <= CENTER_ERROR_LIMIT && lineFirst >= 2 && lineLast <= 5;
   // Nhánh chữ L nối liền mắt giữa và mép về một phía.
   const bool leftWing = atCenter && lineFirst <= 1 && lineLast <= 4;
@@ -189,12 +195,10 @@ void stepLineFollowing(unsigned long elapsedUs) {
   if (followState == FOLLOW_LINE) {
     if (centered || nowMs - lastTurnMs > TURN_MEMORY_MS) {
       lastTurnDirection = 0;
-      cornerArmed = false;
     }
     if (wing != 0) {
       wingSamples = wing == wingDirection ? min(wingSamples + 1, CENTER_CONFIRM_SAMPLES) : 1;
       if (wingSamples >= CENTER_CONFIRM_SAMPLES) {
-        cornerArmed = true;
         lastTurnDirection = wing;
         lastTurnMs = nowMs;
       }
@@ -202,31 +206,32 @@ void stepLineFollowing(unsigned long elapsedUs) {
       wingSamples = 0;
     }
     wingDirection = wing;
-    const int side = steeringError > 0 ? 1 : -1;
+    const int side = (steeringError > 0) - (steeringError < 0);
+    if (hasLine && side != 0 && side != lastTurnDirection && wing == 0) lastTurnDirection = 0;
     if (hasLine && absError >= SEARCH_DIRECTION_MIN_ERROR) {
-      if (side != lastTurnDirection) cornerArmed = false;
       lastTurnDirection = side;
       lastTurnMs = nowMs;
     }
-    // Cua thường tiếp tục dùng PID. Chỉ chốt góc khi tâm đã rời vạch cũ.
-    if (!hasLine || (cornerArmed && !atCenter && side == lastTurnDirection)) {
+    // Dùng hướng nhớ chỉ trong khoảng toàn bộ dãy mất vạch.
+    if (!hasLine) {
       followState = lastTurnDirection != 0 ? SEARCH_LINE : WAIT_FOR_LINE;
       searchStartMs = nowMs;
       wingSamples = centeredSamples = 0;
-      cornerArmed = false;
       integral = 0;
     }
   } else {
-    if (followState == SEARCH_LINE && nowMs - searchStartMs >= SEARCH_TIMEOUT_MS) {
+    if (!hasLine && followState == SEARCH_LINE && nowMs - searchStartMs >= SEARCH_TIMEOUT_MS) {
       followState = WAIT_FOR_LINE;
       lastTurnDirection = 0;
       centeredSamples = 0;
     }
     centeredSamples = centered ? centeredSamples + 1 : 0;
-    if (centeredSamples >= CENTER_CONFIRM_SAMPLES) {
+    if ((hasStarted && hasLine) || centeredSamples >= CENTER_CONFIRM_SAMPLES) {
       followState = FOLLOW_LINE;
+      hasStarted = true;
       lastError = effectiveErr;
-      lastTurnDirection = 0;
+      lastTurnDirection = absError >= SEARCH_DIRECTION_MIN_ERROR ? (steeringError > 0 ? 1 : -1) : 0;
+      lastTurnMs = nowMs;
     }
   }
   int leftCmd = 0;
