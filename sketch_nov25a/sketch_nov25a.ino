@@ -45,8 +45,9 @@ const float TURN_ASSIST_FULL_ERROR = 0.62f;
 const float SEARCH_DIRECTION_MIN_ERROR = 0.30f;
 const float CENTER_ERROR_LIMIT = 0.24f;
 const int CENTER_CONFIRM_SAMPLES = 3;
-const unsigned long TURN_MEMORY_MS = 60;
-const unsigned long SEARCH_TIMEOUT_MS = 180;
+const unsigned long TURN_MEMORY_MS = 320;
+const unsigned long FIRST_SWEEP_MS = 240;
+const unsigned long SEARCH_TIMEOUT_MS = 800;
 const unsigned long LOOP_INTERVAL_US = 2000; // 500 Hz nếu đọc ADC và log kịp
 const unsigned long LOG_INTERVAL_MS = 50;
 
@@ -192,10 +193,8 @@ void stepLineFollowing(unsigned long elapsedUs) {
   int wing = rightWing ? 1 : (leftWing ? -1 : 0);
   if (INVERT_STEERING) wing = -wing;
 
-  if (followState == FOLLOW_LINE) {
-    if (centered || nowMs - lastTurnMs > TURN_MEMORY_MS) {
-      lastTurnDirection = 0;
-    }
+  // Ghi hướng kể cả ở mẫu đầu tiên vừa bắt lại vạch. Mẫu giữa không xóa lịch sử.
+  if (hasLine && (hasStarted || centered)) {
     if (wing != 0) {
       wingSamples = wing == wingDirection ? min(wingSamples + 1, CENTER_CONFIRM_SAMPLES) : 1;
       if (wingSamples >= CENTER_CONFIRM_SAMPLES) {
@@ -207,14 +206,17 @@ void stepLineFollowing(unsigned long elapsedUs) {
     }
     wingDirection = wing;
     const int side = (steeringError > 0) - (steeringError < 0);
-    if (hasLine && side != 0 && side != lastTurnDirection && wing == 0) lastTurnDirection = 0;
-    if (hasLine && absError >= SEARCH_DIRECTION_MIN_ERROR) {
+    const bool oneSide = lineLast <= 3 || lineFirst >= 4;
+    if (side != 0 && (oneSide || absError >= SEARCH_DIRECTION_MIN_ERROR)) {
       lastTurnDirection = side;
       lastTurnMs = nowMs;
     }
-    // Dùng hướng nhớ chỉ trong khoảng toàn bộ dãy mất vạch.
+  }
+  if (followState == FOLLOW_LINE) {
     if (!hasLine) {
-      followState = lastTurnDirection != 0 ? SEARCH_LINE : WAIT_FOR_LINE;
+      const bool recent = lastTurnDirection != 0 && nowMs - lastTurnMs <= TURN_MEMORY_MS;
+      followState = recent ? SEARCH_LINE : WAIT_FOR_LINE;
+      if (!recent) lastTurnDirection = 0;
       searchStartMs = nowMs;
       wingSamples = centeredSamples = 0;
       integral = 0;
@@ -230,8 +232,6 @@ void stepLineFollowing(unsigned long elapsedUs) {
       followState = FOLLOW_LINE;
       hasStarted = true;
       lastError = effectiveErr;
-      lastTurnDirection = absError >= SEARCH_DIRECTION_MIN_ERROR ? (steeringError > 0 ? 1 : -1) : 0;
-      lastTurnMs = nowMs;
     }
   }
   int leftCmd = 0;
@@ -261,7 +261,9 @@ void stepLineFollowing(unsigned long elapsedUs) {
     rightCmd = (int)(right + 0.5f);
   } else if (followState == SEARCH_LINE) {
     // Quay quanh bánh trong để tìm lại vạch theo hướng đã thấy.
-    if (lastTurnDirection > 0) leftCmd = min(SEARCH_OUTER_PWM, RUN_BASE_PWM);
+    int searchDirection = lastTurnDirection;
+    if (nowMs - searchStartMs >= FIRST_SWEEP_MS) searchDirection = -searchDirection;
+    if (searchDirection > 0) leftCmd = min(SEARCH_OUTER_PWM, RUN_BASE_PWM);
     else rightCmd = min(SEARCH_OUTER_PWM, RUN_BASE_PWM);
   }
 
@@ -270,7 +272,7 @@ void stepLineFollowing(unsigned long elapsedUs) {
 
   if (nowMs - lastPrintMs >= LOG_INTERVAL_MS) {
     lastPrintMs = nowMs;
-    if (followState == SEARCH_LINE) Serial.print("SEARCH ");
+    if (followState == SEARCH_LINE) Serial.print(leftCmd > 0 ? "SEARCH_R " : "SEARCH_L ");
     else if (followState == WAIT_FOR_LINE) Serial.print("STOP ");
     else Serial.print(turnAssist > 0.0f ? "TURN " : "LINE ");
     Serial.print("err=");
