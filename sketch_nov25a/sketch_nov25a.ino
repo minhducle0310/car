@@ -27,7 +27,9 @@ const long MOTOR_RATED_MV = 6000;
 const long BATTERY_FULL_MV = 8400;
 const int MAX_DRIVE_PWM = PWM_FULL_SCALE * MOTOR_RATED_MV / BATTERY_FULL_MV; // 182
 const int BASE_SPEED = 150;
-const int SEARCH_OUTER_PWM = 150;
+const int CORNER_PWM = 60;
+const unsigned long PIVOT_BRAKE_MS = 12;
+const unsigned long EXIT_RAMP_MS = 120;
 static_assert(BASE_SPEED <= MAX_DRIVE_PWM, "BASE_SPEED vuot gioi han PWM");
 
 // ---------------- THÔNG SỐ PID (TUNE Kp TRƯỚC, Ki = 0, Kd = 0) ----------------
@@ -45,7 +47,7 @@ const float SEARCH_DIRECTION_MIN_ERROR = 0.30f;
 const float CENTER_ERROR_LIMIT = 0.24f;
 const int CENTER_CONFIRM_SAMPLES = 3;
 const unsigned long TURN_MEMORY_MS = 60;
-const unsigned long SEARCH_TIMEOUT_MS = 180;
+const unsigned long SEARCH_TIMEOUT_MS = 400;
 const unsigned long LOOP_INTERVAL_US = 2000; // 500 Hz nếu đọc ADC và log kịp
 const unsigned long LOG_INTERVAL_MS = 50;
 
@@ -62,6 +64,9 @@ float lastError = 0.0f;
 float integral = 0.0f;
 int lastTurnDirection = 0;
 int centeredSamples = 0;
+int previousEdge = 0;
+bool accelerating = false;
+unsigned long centeredSinceMs = 0;
 unsigned long lastTurnMs = 0;
 unsigned long searchStartMs = 0;
 unsigned long lastLoopMicros = 0;
@@ -143,14 +148,15 @@ bool computeLineError(float &outError, float &outMaxStrength) {
 }
 
 void setSingleMotor(int pwmPin, int in1Pin, int in2Pin, bool invertDir, int speed) {
-  const int pwm = constrain(speed, 0, MAX_DRIVE_PWM);
+  const int pwm = constrain(abs(speed), 0, MAX_DRIVE_PWM);
+  const bool reverse = (speed < 0) != invertDir;
   if (pwm == 0) {
     // TB6612FNG: IN1 = IN2 = HIGH để phanh ngắn mạch bánh.
     digitalWrite(in1Pin, HIGH);
     digitalWrite(in2Pin, HIGH);
   } else {
-    digitalWrite(in1Pin, invertDir ? LOW : HIGH);
-    digitalWrite(in2Pin, invertDir ? HIGH : LOW);
+    digitalWrite(in1Pin, reverse ? LOW : HIGH);
+    digitalWrite(in2Pin, reverse ? HIGH : LOW);
   }
   analogWrite(pwmPin, pwm);
 }
@@ -166,7 +172,21 @@ void stepLineFollowing(unsigned long elapsedUs) {
   const bool seesCenter = hasLine && absError <= CENTER_ERROR_LIMIT &&
       (lastStrength[3] >= ACTIVE_STRENGTH_THRESHOLD || lastStrength[4] >= ACTIVE_STRENGTH_THRESHOLD);
 
-  if (followState == FOLLOW_LINE && !hasLine) {
+  // Mép đậm một phía vẫn báo được góc chữ L khi các mắt giữa còn thấy nhánh cũ.
+  const float leftEdge = max(lastStrength[0], lastStrength[1]);
+  const float rightEdge = max(lastStrength[6], lastStrength[7]);
+  int edge = 0;
+  if (leftEdge >= LINE_HOLD_STRENGTH && rightEdge < ACTIVE_STRENGTH_THRESHOLD) edge = -1;
+  if (rightEdge >= LINE_HOLD_STRENGTH && leftEdge < ACTIVE_STRENGTH_THRESHOLD) edge = 1;
+  if (INVERT_STEERING) edge = -edge;
+  const bool corner = edge != 0 && edge == previousEdge;
+  if (followState == FOLLOW_LINE && edge != 0) {
+    lastTurnDirection = edge;
+    lastTurnMs = nowMs;
+  }
+  previousEdge = followState == FOLLOW_LINE ? edge : 0;
+
+  if (followState == FOLLOW_LINE && (corner || !hasLine)) {
     const bool knowsDirection = lastTurnDirection != 0 && nowMs - lastTurnMs <= TURN_MEMORY_MS;
     followState = knowsDirection ? SEARCH_LINE : WAIT_FOR_LINE;
     searchStartMs = nowMs;
@@ -180,11 +200,16 @@ void stepLineFollowing(unsigned long elapsedUs) {
   }
 
   if (followState != FOLLOW_LINE) {
-    centeredSamples = seesCenter ? centeredSamples + 1 : 0;
+    const bool clearCenter = seesCenter && leftEdge < ACTIVE_STRENGTH_THRESHOLD &&
+        rightEdge < ACTIVE_STRENGTH_THRESHOLD;
+    const bool canResume = followState == WAIT_FOR_LINE || nowMs - searchStartMs >= PIVOT_BRAKE_MS;
+    centeredSamples = clearCenter && canResume ? centeredSamples + 1 : 0;
     if (centeredSamples >= CENTER_CONFIRM_SAMPLES) {
       followState = FOLLOW_LINE;
       lastError = effectiveErr;
       lastTurnDirection = 0;
+      accelerating = true;
+      centeredSinceMs = nowMs;
     }
   }
 
@@ -192,7 +217,7 @@ void stepLineFollowing(unsigned long elapsedUs) {
   int rightCmd = 0;
   float turnAssist = 0.0f;
   if (followState == FOLLOW_LINE) {
-    if (absError >= SEARCH_DIRECTION_MIN_ERROR) {
+    if (edge == 0 && absError >= SEARCH_DIRECTION_MIN_ERROR) {
       lastTurnDirection = steeringError > 0.0f ? 1 : -1;
       lastTurnMs = nowMs;
     }
@@ -205,8 +230,16 @@ void stepLineFollowing(unsigned long elapsedUs) {
     lastError = effectiveErr;
     if (INVERT_STEERING) turn = -turn;
 
-    float left = constrain(BASE_SPEED + turn, 0.0f, (float)MAX_DRIVE_PWM);
-    float right = constrain(BASE_SPEED - turn, 0.0f, (float)MAX_DRIVE_PWM);
+    const float curve = constrain((absError - 0.12f) / 0.30f, 0.0f, 1.0f);
+    float base = BASE_SPEED - (BASE_SPEED - CORNER_PWM) * curve;
+    if (edge != 0) base = CORNER_PWM;
+    if (accelerating) {
+      unsigned long age = nowMs - centeredSinceMs;
+      if (age >= EXIT_RAMP_MS) accelerating = false;
+      else base = min(base, CORNER_PWM + (BASE_SPEED - CORNER_PWM) * (float)age / EXIT_RAMP_MS);
+    }
+    float left = constrain(base + turn, 0.0f, (float)MAX_DRIVE_PWM);
+    float right = constrain(base - turn, 0.0f, (float)MAX_DRIVE_PWM);
     turnAssist = constrain((absError - TURN_ASSIST_START_ERROR) /
         (TURN_ASSIST_FULL_ERROR - TURN_ASSIST_START_ERROR), 0.0f, 1.0f);
 
@@ -216,9 +249,11 @@ void stepLineFollowing(unsigned long elapsedUs) {
     leftCmd = (int)(left + 0.5f);
     rightCmd = (int)(right + 0.5f);
   } else if (followState == SEARCH_LINE) {
-    // Quay quanh bánh trong để tìm lại vạch theo hướng đã thấy.
-    if (lastTurnDirection > 0) leftCmd = SEARCH_OUTER_PWM;
-    else rightCmd = SEARCH_OUTER_PWM;
+    // Phanh ngắn trước khi đảo bánh trong để xoay tại chỗ.
+    if (nowMs - searchStartMs >= PIVOT_BRAKE_MS) {
+      leftCmd = lastTurnDirection * CORNER_PWM;
+      rightCmd = -leftCmd;
+    }
   }
 
   setSingleMotor(PWMA_PIN, AIN1_PIN, AIN2_PIN, INVERT_MOTOR_A, leftCmd);
